@@ -1,6 +1,6 @@
 // 家計簿アプリのオフライン対応：画面のファイルを端末に保存しておく
 // （データの読み書きは Apps Script と直接やりとりし、ここでは扱わない）
-const CACHE = "kakeibo-v1";
+const CACHE = "kakeibo-v2";
 const SHELL = ["./", "index.html", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/icon-maskable-512.png", "icons/apple-touch-icon.png", "icons/icon-32.png"];
 

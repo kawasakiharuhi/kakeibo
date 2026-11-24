@@ -540,27 +540,38 @@ function startEdit(id){
 }
 
 // ---- 保存（スプシの月シートに書き込む） ----
+const sameTx=(a,b)=>a.date===b.date&&a.type===b.type&&a.account===b.account&&(a.to||"")===(b.to||"")&&Number(a.amount)===Number(b.amount)&&(a.memo||"")===(b.memo||"");
+// 返事を受け取れなかったとき：スプシを読み直して、書き込みが反映されているか確かめる
+async function verifyWrite(check){
+  try{ const j=await api.get("list"); const list=j.txs.filter(t=>t.date&&t.amount!=null); return check(list) ? list : null; }
+  catch(_){ return null; }
+}
 async function save(){
   const amount=parseAmt(); if(!amount||!api.ready()) return;
   const data={date:$("#date").value, type:state.type, account:state.from, amount, memo:$("#memo").value.trim()};
   if(state.type==="transfer"){ if(state.to===state.from){toast("出金元と入金先が同じです");return;} data.to=state.to; }
   const btn=$("#saveBtn"); btn.disabled=true; btn.textContent="保存中…";
   const editing=state.editId;
-  try{
-    if(editing){
-      const old=txs.find(x=>x.id===editing);
-      await api.save({...data,id:editing}, old);
-      upsertLocal({...data,id:editing,createdAt:old?.createdAt||Date.now()});
-      toast("更新しました");
-    }else{
-      await api.save(data);
-      upsertLocal({...data,id:"tmp-"+Date.now(),createdAt:Date.now()*10});
-      toast(`${accName(data.account)}：${yen(amount)} を記録しました`);
-    }
+  const old=editing?txs.find(x=>x.id===editing):null;
+  const beforeCount=txs.filter(t=>sameTx(t,data)).length;
+  const done=()=>{
+    toast(editing?"更新しました":`${accName(data.account)}：${yen(amount)} を記録しました`);
     viewMonth=data.date.slice(0,7);
     resetForm(true);
+  };
+  try{
+    await api.save(editing?{...data,id:editing}:data, old||undefined);
+    if(editing) upsertLocal({...data,id:editing,createdAt:old?.createdAt||Date.now()});
+    else upsertLocal({...data,id:"tmp-"+Date.now(),createdAt:Date.now()*10});
+    done();
     load(true);   // スプシ上の行番号（id）を取り直す
-  }catch(e){ handleWriteError(e); btn.textContent=editing?"更新する":"記録する"; validate(); }
+  }catch(e){
+    if(e&&(e.message==="unauthorized"||e.message==="conflict"||e.message==="bad_tx")){ handleWriteError(e); btn.textContent=editing?"更新する":"記録する"; validate(); return; }
+    btn.textContent="確認中…";
+    const list=await verifyWrite(l=>l.filter(t=>sameTx(t,data)).length>beforeCount);
+    if(list){ txs=list; sortTxs(); cacheSave(); renderAll(); done(); return; }
+    handleWriteError(e); btn.textContent=editing?"更新する":"記録する"; validate();
+  }
 }
 let delArmed=false;
 function disarmDelete(){ delArmed=false; const b=$("#delBtn"); b.classList.remove("armed"); b.textContent="この記録を削除"; }
@@ -568,14 +579,20 @@ async function del(){
   if(!state.editId) return;
   if(!delArmed){ delArmed=true; const b=$("#delBtn"); b.classList.add("armed"); b.textContent="もう一度押すと削除します"; setTimeout(disarmDelete,4000); return; }
   const id=state.editId, old=txs.find(x=>x.id===id);
+  const before=txs.filter(t=>sameTx(t,old)).length;
   try{ await api.remove(id, old); txs=txs.filter(t=>t.id!==id); renderAll(); toast("削除しました"); resetForm(); load(true); }
-  catch(e){ handleWriteError(e); }
+  catch(e){
+    if(e&&(e.message==="unauthorized"||e.message==="conflict")){ handleWriteError(e); return; }
+    const list=await verifyWrite(l=>l.filter(t=>sameTx(t,old)).length<before);
+    if(list){ txs=list; sortTxs(); cacheSave(); renderAll(); toast("削除しました"); resetForm(); return; }
+    handleWriteError(e);
+  }
 }
 function handleWriteError(e){
   if(e&&e.message==="unauthorized"){ toast("キーが違うため保存できません。設定を確認してください"); openSetup(); }
   else if(e&&e.message==="conflict"){ toast("スプシ側で内容が変わっていたので読み直しました。もう一度操作してください"); resetForm(); load(); }
   else if(!navigator.onLine){ toast("オフラインのため保存できません。電波のある所でもう一度お試しください"); }
-  else toast("保存できませんでした。もう一度お試しください");
+  else toast("保存できませんでした。もう一度お試しください"+(e&&e.message?`（${e.message.slice(0,40)}）`:""));
 }
 function upsertLocal(t){
   const i=txs.findIndex(x=>x.id===t.id); if(i>=0) txs[i]=t; else txs.push(t);
@@ -624,8 +641,19 @@ const api={
     const r=await fetch(this.url,{method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify({...body,key:this.key})});
     const j=await r.json(); if(!j.ok) throw new Error(j.error||"error"); return j;
   },
-  save(tx, orig){ return this.post({action:"save",tx,orig}); },
-  remove(id, orig){ return this.post({action:"delete",id,orig}); },
+  // 書き込みは読み込みと同じ GET で送る（POST だと返事を受け取れない環境があるため）。
+  // 古い Apps Script（GET での保存に未対応）のときだけ POST で送り直す。
+  async write(body){
+    const {action,...rest}=body;
+    const url=`${this.url}?action=${action}&key=${encodeURIComponent(this.key)}&payload=${encodeURIComponent(JSON.stringify(rest))}&_=${Date.now()}`;
+    const r=await fetch(url,{cache:"no-store"});
+    const j=await r.json();
+    if(!j.ok && j.error==="unknown_action") return this.post(body);
+    if(!j.ok) throw new Error(j.error||"error");
+    return j;
+  },
+  save(tx, orig){ return this.write({action:"save",tx,orig}); },
+  remove(id, orig){ return this.write({action:"delete",id,orig}); },
 };
 function cacheSave(){ ls.set(LS.cache, JSON.stringify({at:Date.now(), txs})); }
 function cacheLoad(){ try{ const c=JSON.parse(ls.get(LS.cache)||"null"); if(c&&Array.isArray(c.txs)){ txs=c.txs; sortTxs(); return c.at; } }catch(_){} return 0; }

@@ -57,6 +57,14 @@ function doGet(e) {
   if (!checkKey_(p.key)) return json_({ ok: false, error: 'unauthorized' });
   if (p.action === 'ping') return json_({ ok: true });
   if (p.action === 'list') return json_({ ok: true, txs: readAll_() });
+  // 保存・削除も GET で受け付ける（ブラウザによっては POST の返事を受け取れず、
+  // 保存できているのにエラーになることがあるため。読み込みと同じ通り道を使う）
+  if (p.action === 'save' || p.action === 'delete') {
+    let body;
+    try { body = JSON.parse(p.payload || '{}'); } catch (err) { return json_({ ok: false, error: 'bad_json' }); }
+    body.action = p.action;
+    return json_(write_(body));
+  }
   return json_({ ok: false, error: 'unknown_action' });
 }
 
@@ -72,32 +80,36 @@ function doPost(e) {
   let body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, error: 'bad_json' }); }
   if (!checkKey_(body.key)) return json_({ ok: false, error: 'unauthorized' });
+  return json_(write_(body));
+}
 
+/** 保存・削除の本体（GET・POST 共通） */
+function write_(body) {
   const lock = LockService.getScriptLock();
   lock.waitLock(15000);
   try {
     if (body.action === 'save') {
       const tx = sanitize_(body.tx);
-      if (!tx) return json_({ ok: false, error: 'bad_tx' });
-      if (!tx.id) return json_({ ok: true, id: append_(tx) });          // 追加
+      if (!tx) return { ok: false, error: 'bad_tx' };
+      if (!tx.id) return { ok: true, id: append_(tx) };                 // 追加
       const loc = locate_(tx.id, body.orig);                            // 編集
-      if (!loc) return json_({ ok: false, error: 'conflict' });
+      if (!loc) return { ok: false, error: 'conflict' };
       const cur = monthSheets_().find(x => x.sheet.getName() === loc.sheet.getName());
       const d = ym_(tx.date);
       if (cur && cur.year === d.y && cur.month === d.m) {
         loc.sheet.getRange(loc.row, COL, 1, NCOL).setValues([toRow_(tx)]);
-        return json_({ ok: true, id: tx.id });
+        return { ok: true, id: tx.id };
       }
       removeRow_(loc.sheet, loc.row);                                   // 月が変わったら移動
-      return json_({ ok: true, id: append_(tx) });
+      return { ok: true, id: append_(tx) };
     }
     if (body.action === 'delete') {
       const loc = locate_(String(body.id || ''), body.orig);
-      if (!loc) return json_({ ok: false, error: 'conflict' });
+      if (!loc) return { ok: false, error: 'conflict' };
       removeRow_(loc.sheet, loc.row);
-      return json_({ ok: true });
+      return { ok: true };
     }
-    return json_({ ok: false, error: 'unknown_action' });
+    return { ok: false, error: 'unknown_action' };
   } finally {
     lock.releaseLock();
   }
